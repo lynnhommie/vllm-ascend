@@ -246,7 +246,18 @@ class ACLGraphWrapper:
                 f"got {new_input_addresses}"
             )
 
-        logger.info_once("Replaying aclgraph")
+        self._replay_count = getattr(self, "_replay_count", 0) + 1
+        if self._replay_count % 100 == 1:
+            # Per-wrapper counter: `logger.info_once` fires once per process, so it
+            # cannot tell which wrapper (target vs draft) is replaying, nor whether
+            # replay happens at all once logging is filtered. Log every 100th replay.
+            logger.info(
+                "Replaying aclgraph #%d runnable=%s mode=%s batch_descriptor=%s",
+                self._replay_count,
+                getattr(self.runnable, "__qualname__", type(self.runnable).__name__),
+                self.runtime_mode.name,
+                entry.batch_descriptor,
+            )
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes
         # before the grph replay of iteration i-1.

@@ -148,6 +148,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.decode_threshold = 1 + self.num_speculative_tokens
         self.query_start_loc = self.runner._make_buffer(self.runner.max_num_reqs + 2, dtype=torch.int32)
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        # Reused staging buffer for the per-propose block-table clone below.
+        self._block_table_clone_buf: torch.Tensor | None = None
 
         self.dcp_size = self.runner.dcp_size
 
@@ -246,6 +248,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.positions = torch.zeros(self.max_num_tokens, dtype=torch.int32, device=device)
 
         self.token_arange_np = np.arange(self.max_num_tokens + 1, dtype=np.int32)
+        self._token_arange_cpu = torch.from_numpy(self.token_arange_np)
         self.enable_enpu = self.runner.enable_enpu
         self.use_eagle = self.runner.use_eagle
         self.draft_window_size = None
@@ -1206,7 +1209,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 : common_attn_metadata.block_table_tensor.shape[0]
             ]
         else:
-            common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor.clone()
+            # Clone into a reused buffer instead of allocating a fresh tensor on
+            # every propose().
+            bt = common_attn_metadata.block_table_tensor
+            if self._block_table_clone_buf is None or self._block_table_clone_buf.shape != bt.shape:
+                self._block_table_clone_buf = torch.empty_like(bt)
+            self._block_table_clone_buf.copy_(bt)
+            common_attn_metadata.block_table_tensor = self._block_table_clone_buf
 
         metadata_has_prefill = bool(getattr(attn_metadata_i, "num_prefills", 0))
         is_prefill_batch = num_prefill_reqs > 0 or metadata_has_prefill
@@ -1819,14 +1828,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         common_attn_metadata.num_computed_tokens_cpu, input_batch_size
                     )
                 common_attn_metadata.query_start_loc = self.arange[: input_batch_size + 1]
-                common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
-                    self.token_arange_np[: input_batch_size + 1]
-                ).clone()
+                common_attn_metadata.query_start_loc_cpu = self._token_arange_cpu[: input_batch_size + 1].clone()
             else:
                 common_attn_metadata.query_start_loc = self.arange[: batch_size + 1]
-                common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
-                    self.token_arange_np[: batch_size + 1]
-                ).clone()
+                common_attn_metadata.query_start_loc_cpu = self._token_arange_cpu[: batch_size + 1].clone()
 
             common_attn_metadata.num_actual_tokens = batch_size
             common_attn_metadata.max_query_len = 1

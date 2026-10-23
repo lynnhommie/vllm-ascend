@@ -247,6 +247,12 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         scheduler_config = vllm_config.scheduler_config
         self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        # `build()` runs once per model forward (target and draft alike) and used
+        # to allocate a fresh pinned block for `query_start_loc` on every call.
+        # Reuse one staging buffer instead.
+        self._pinned_query_start_loc = torch.empty(
+            scheduler_config.max_num_seqs + 2, dtype=torch.int32, device="cpu", pin_memory=True
+        )
 
     @classmethod
     def get_cudagraph_support(
@@ -327,7 +333,11 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config)
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
-        query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
+        n = num_reqs + 1
+        if self._pinned_query_start_loc.shape[0] < n:
+            self._pinned_query_start_loc = torch.empty(n, dtype=torch.int32, device="cpu", pin_memory=True)
+        self._pinned_query_start_loc[:n].copy_(query_start_loc_cpu)
+        query_start_loc = self._pinned_query_start_loc[:n].to(self.device, non_blocking=True)
 
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
         seq_lens_list = seq_lens.tolist()
