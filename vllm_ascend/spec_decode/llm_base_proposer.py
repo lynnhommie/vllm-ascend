@@ -1063,27 +1063,34 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         uniform_decode = target_model_batch_desc.uniform
 
         if self.use_cuda_graph:
-            _, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
-                num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=has_lora
-            )
-            num_input_tokens = batch_descriptor.num_tokens
-        else:
-            num_input_tokens = num_tokens
-
-        (
-            num_input_tokens,
-            num_tokens_across_dp,
-            _,
-        ) = self.runner._sync_metadata_across_dp(num_input_tokens, is_draft_model=True)
-
-        if self.use_cuda_graph:
             aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
-                num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora
+                num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=has_lora
             )
             num_input_tokens = batch_descriptor.num_tokens
         else:
             aclgraph_runtime_mode = CUDAGraphMode.NONE
             batch_descriptor = None
+            num_input_tokens = num_tokens
+
+        if self.runner.dp_size == 1:
+            # DP=1: `_sync_metadata_across_dp` is a pure pass-through (see its
+            # `if self.dp_size == 1: return num_tokens, None, cudagraph_mode`),
+            # so the second dispatch below would be called with the identical
+            # `num_input_tokens` and return the identical descriptor. Skip both.
+            num_tokens_across_dp = None
+        else:
+            (
+                num_input_tokens,
+                num_tokens_across_dp,
+                aclgraph_runtime_mode,
+            ) = self.runner._sync_metadata_across_dp(
+                num_input_tokens, is_draft_model=True, cudagraph_mode=aclgraph_runtime_mode
+            )
+            if self.use_cuda_graph:
+                aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
+                    num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora
+                )
+                num_input_tokens = batch_descriptor.num_tokens
 
         if aclgraph_runtime_mode == CUDAGraphMode.FULL:
             # TODO: Due to the inconsistency between the proposer `dispatcher` and model runner, this padding
@@ -1617,7 +1624,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_tokens = target_token_ids.shape[0]
             # Shift the input ids by one token.
             # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
-            self.input_ids[: num_tokens - 1] = target_token_ids[1:]
+            # NOTE: for the single-stream decode case (num_tokens == 1) this is
+            # an empty assignment; skip the launch entirely.
+            if num_tokens > 1:
+                self.input_ids[: num_tokens - 1] = target_token_ids[1:]
             # Replace the last token with the next token.
             # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
             self.input_ids[token_indices_to_sample] = next_token_ids
