@@ -249,10 +249,14 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
         # `build()` runs once per model forward (target and draft alike) and used
         # to allocate a fresh pinned block for `query_start_loc` on every call.
-        # Reuse one staging buffer instead.
-        self._pinned_query_start_loc = torch.empty(
-            scheduler_config.max_num_seqs + 2, dtype=torch.int32, device="cpu", pin_memory=True
-        )
+        # Reuse a pair of staging buffers instead: the H2D below is async, so a
+        # single buffer could be overwritten while the copy it backs is still in
+        # flight. Two buffers give the previous copy a full iteration of slack.
+        self._pinned_query_start_loc = [
+            torch.empty(scheduler_config.max_num_seqs + 2, dtype=torch.int32, device="cpu", pin_memory=True),
+            torch.empty(scheduler_config.max_num_seqs + 2, dtype=torch.int32, device="cpu", pin_memory=True),
+        ]
+        self._pinned_query_start_loc_idx = 0
 
     @classmethod
     def get_cudagraph_support(
@@ -334,10 +338,15 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         n = num_reqs + 1
-        if self._pinned_query_start_loc.shape[0] < n:
-            self._pinned_query_start_loc = torch.empty(n, dtype=torch.int32, device="cpu", pin_memory=True)
-        self._pinned_query_start_loc[:n].copy_(query_start_loc_cpu)
-        query_start_loc = self._pinned_query_start_loc[:n].to(self.device, non_blocking=True)
+        if self._pinned_query_start_loc[0].shape[0] < n:
+            self._pinned_query_start_loc = [
+                torch.empty(n, dtype=torch.int32, device="cpu", pin_memory=True),
+                torch.empty(n, dtype=torch.int32, device="cpu", pin_memory=True),
+            ]
+        buf = self._pinned_query_start_loc[self._pinned_query_start_loc_idx]
+        self._pinned_query_start_loc_idx = 1 - self._pinned_query_start_loc_idx
+        buf[:n].copy_(query_start_loc_cpu)
+        query_start_loc = buf[:n].to(self.device, non_blocking=True)
 
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
         seq_lens_list = seq_lens.tolist()
