@@ -2413,7 +2413,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_input_tokens,
         num_actual_tokens,
     ):
-        # FIXME(woosuk): The below two ops cause synchronization. Optimize.
+        # NOTE: the historical FIXME about two synchronizing ops here is
+        # resolved on this path — model_runner always populates
+        # `_seq_lens_cpu` (from optimistic_seq_lens_cpu), so builder.build()
+        # reads CPU tensors throughout and its `.tolist()` calls do not sync.
         assert len(self.draft_attn_groups) > 0
         per_layer_attn_metadata: dict[str, Any] = {}
         for attn_group in self.draft_attn_groups:

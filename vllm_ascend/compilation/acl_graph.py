@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -269,7 +270,18 @@ class ACLGraphWrapper:
         # When FULL + EAGLE draft (merge path), replay does not need this barrier.
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
-        if not self.enable_enpu and need_sync:
+        # A/B knob (VLLM_ASCEND_NO_REPLAY_SYNC=1): the barrier below costs a
+        # full-device synchronize per FULL replay (twice per MTP iteration,
+        # target + draft). It only guards the async/MT ordering hazard
+        # described above, so synchronous single-threaded scheduling is
+        # expected to skip it safely. Default keeps the barrier; runs with the
+        # knob on must pass a correctness smoke before their bench numbers
+        # are trusted.
+        if (
+            not self.enable_enpu
+            and need_sync
+            and os.environ.get("VLLM_ASCEND_NO_REPLAY_SYNC") != "1"
+        ):
             torch.npu.current_stream().synchronize()
         entry.aclgraph.replay()
         return entry.output
