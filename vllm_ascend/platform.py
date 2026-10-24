@@ -542,6 +542,26 @@ class NPUPlatform(Platform):
             )
             compilation_config.cudagraph_mode = cudagraph_mode
 
+        # Dynamic speculative decoding normally forces PIECEWISE upstream: the
+        # draft graph bakes K into its reshapes while one token bucket can
+        # serve several K. We key draft graph entries by (batch_descriptor, K)
+        # instead (acl_graph.py), so FULL graphs stay valid under per-step K
+        # changes. Restore FULL_AND_PIECEWISE when the dynamic-K feature knob
+        # is on; default keeps upstream's PIECEWISE behavior.
+        if (
+            os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K") == "1"
+            and vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.method == "mtp"
+            and vllm_config.speculative_config.uses_dynamic_speculative_decoding()
+            and compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+            and not model_config.enforce_eager
+        ):
+            logger.info(
+                "Dynamic MTP spec: restoring FULL_AND_PIECEWISE "
+                "(draft graph entries keyed by K)."
+            )
+            compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+
         # get custom compile backend for graph fusion
         compilation_config.oot_compiler = cls.get_compile_backend()
 
