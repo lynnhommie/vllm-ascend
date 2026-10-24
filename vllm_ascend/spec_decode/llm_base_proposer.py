@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from functools import partial
@@ -18,6 +19,12 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
 from vllm.logger import logger
+
+# A/B knob for the dynamic speculative decoding hook in _propose: when set,
+# the per-step K published by the scheduler (configured via
+# num_speculative_tokens_per_batch_size) overrides the config K, mirroring
+# what upstream's core propose() does for its own callers.
+_MTP_DYNAMIC_K = os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K") == "1"
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
@@ -1033,6 +1040,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_draft_tokens_cpu: list[int] | None = None,
     ) -> torch.Tensor:
         batch_size = common_attn_metadata.batch_size()
+
+        # Dynamic speculative decoding hook (VLLM_ASCEND_MTP_DYNAMIC_K=1):
+        # upstream's core propose() rebinds self.num_speculative_tokens from
+        # its argument each call, but the MTP path calls _propose directly and
+        # would otherwise stay pinned to the config K. The scheduler already
+        # publishes the per-step K on SchedulerOutput when the user sets
+        # num_speculative_tokens_per_batch_size (validated upstream so the
+        # scheduled K never exceeds the config K that sized our buffers).
+        # Default (env unset) keeps the config K: zero behavior change.
+        if _MTP_DYNAMIC_K and scheduler_output is not None:
+            step_k = getattr(scheduler_output, "num_spec_tokens_to_schedule", None)
+            if step_k is not None and step_k != self.num_speculative_tokens:
+                logger.info(
+                    "dynamic K: %d -> %d (batch spec schedule)",
+                    self.num_speculative_tokens,
+                    step_k,
+                )
+                self.num_speculative_tokens = step_k
+                self.decode_threshold = 1 + step_k
 
         if token_indices_to_sample is None:
             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
