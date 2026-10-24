@@ -931,6 +931,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             batch_descriptor=batch_descriptor,
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
+            num_spec_tokens=self.num_speculative_tokens,
             draft_attn_metadatas=multi_steps_attn_metadata,
             eplb_heat_collection_status=(
                 self.runner.eplb_heat_collection_status if self.runner.dynamic_eplb else False
@@ -1313,6 +1314,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             batch_descriptor=batch_descriptor,
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
+            num_spec_tokens=self.num_speculative_tokens,
             draft_attn_metadatas=multi_steps_attn_metadata,
             eplb_heat_collection_status=(
                 self.runner.eplb_heat_collection_status if self.runner.dynamic_eplb else False

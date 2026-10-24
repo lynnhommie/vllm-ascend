@@ -111,8 +111,9 @@ class ACLGraphWrapper:
             cudagraph_options = CUDAGraphOptions()
         self.aclgraph_options = cudagraph_options
         # the entries for different batch descriptors that we need to capture
-        # aclgraphs for.
-        self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
+        # aclgraphs for. Draft-model entries are keyed by (batch_descriptor, K)
+        # under dynamic speculative decoding (see __call__).
+        self.concrete_aclgraph_entries: dict[BatchDescriptor | tuple[BatchDescriptor, int], ACLGraphEntry] = {}
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
         _acl_graph_wrappers.add(self)
@@ -145,11 +146,23 @@ class ACLGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
-        if batch_descriptor not in self.concrete_aclgraph_entries:
-            # create a new entry for this batch descriptor
-            self.concrete_aclgraph_entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)
+        # Dynamic speculative decoding: the draft runnable's graph bakes the
+        # runtime num_spec_tokens into its reshapes, and two different K can
+        # share one token bucket (e.g. 4 reqs x K=1 and 2 reqs x K=3 are both
+        # 8 tokens). Key draft entries by (batch_descriptor, K) so each K
+        # gets its own captured graph; the target model keeps the plain
+        # descriptor key (its forward does not depend on K).
+        entry_key = batch_descriptor
+        if forward_context.is_draft_model:
+            draft_k = getattr(forward_context, "num_spec_tokens", None)
+            if draft_k is not None:
+                entry_key = (batch_descriptor, draft_k)
 
-        entry = self.concrete_aclgraph_entries[batch_descriptor]
+        if entry_key not in self.concrete_aclgraph_entries:
+            # create a new entry for this batch descriptor (and K, for drafts)
+            self.concrete_aclgraph_entries[entry_key] = ACLGraphEntry(batch_descriptor=batch_descriptor)
+
+        entry = self.concrete_aclgraph_entries[entry_key]
 
         if entry.aclgraph is None:
             if self.aclgraph_options.debug_log_enable:

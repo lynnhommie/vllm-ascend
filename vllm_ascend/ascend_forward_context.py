@@ -109,6 +109,7 @@ def set_ascend_forward_context(
     batch_descriptor: BatchDescriptor | None = None,
     model_instance: torch.nn.Module = None,
     is_draft_model=False,
+    num_spec_tokens: int | None = None,
     skip_compiled: bool = False,
     max_tokens_across_pcp: int = 0,
     draft_attn_metadatas=None,
@@ -204,6 +205,10 @@ def set_ascend_forward_context(
         forward_context.model_instance = model_instance
         forward_context.is_draft_model = is_draft_model
         forward_context.is_draft_model_prefill = False
+        # Runtime speculative-token count for this forward, used by the
+        # draft ACLGraphWrapper to key entries by (batch_descriptor, K) under
+        # dynamic speculative decoding. None on the target model path.
+        forward_context.num_spec_tokens = num_spec_tokens
 
         if num_tokens is None and attn_metadata is not None:
             num_tokens = attn_metadata.num_actual_tokens
