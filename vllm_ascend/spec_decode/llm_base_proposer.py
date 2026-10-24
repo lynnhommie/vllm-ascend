@@ -150,6 +150,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
         # Reused staging buffer for the per-propose block-table clone below.
         self._block_table_clone_buf: torch.Tensor | None = None
+        # A-route pooling (PR #17178 pattern): `_adjust_tensor` used to
+        # allocate a fresh padded tensor (F.pad = alloc + copy) on every call,
+        # 4-6 times per propose on the FULL path. Pool the padded results by
+        # (source address, padded size, source length); entries are created
+        # zero-filled, so the pad tail stays zero without re-clearing. The
+        # capacity cap keeps ephemeral sources from growing the dict forever.
+        self._adjust_scratch: dict[tuple, torch.Tensor] = {}
+        # Reused scratch for the sampled-token clone in
+        # prepare_next_token_ids_padded (one device copy saved per iteration).
+        self._valid_sampled_scratch: torch.Tensor | None = None
 
         self.dcp_size = self.runner.dcp_size
 
@@ -2034,7 +2044,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # Mask out the sampled tokens indices that should not be sampled.
         discard_sampled_tokens_req_indices = discard_request_indices[:num_discarded_requests]
 
-        valid_sampled_token_ids_gpu = sampled_token_ids.clone()
+        # Reuse a persistent scratch instead of cloning every iteration: the
+        # buffer is consumed (index_fill + downstream reductions) within this
+        # call, so cross-iteration aliasing is safe and one alloc + device
+        # copy per iteration is saved.
+        if (
+            self._valid_sampled_scratch is None
+            or self._valid_sampled_scratch.shape != sampled_token_ids.shape
+            or self._valid_sampled_scratch.dtype != sampled_token_ids.dtype
+            or self._valid_sampled_scratch.device != sampled_token_ids.device
+        ):
+            self._valid_sampled_scratch = torch.empty_like(sampled_token_ids)
+        self._valid_sampled_scratch.copy_(sampled_token_ids)
+        valid_sampled_token_ids_gpu = self._valid_sampled_scratch
         valid_sampled_token_ids_gpu = DeviceOperator.index_fill(
             valid_sampled_token_ids_gpu,
             0,
@@ -2313,12 +2335,29 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     # adjusting tensor into desired size
     def _adjust_tensor(self, tensor, desired_size):
         pad_size = desired_size - tensor.shape[0]
-        if pad_size > 0:
-            pad = [0] * (2 * tensor.dim() - 1) + [pad_size]
-            tensor = F.pad(tensor, pad, mode="constant", value=0)
-        else:
-            tensor = tensor[:desired_size]
-        return tensor
+        if pad_size <= 0:
+            return tensor[:desired_size]
+        # Pool the padded result instead of F.pad-allocating on every call
+        # (host alloc + device copy, 4-6x per propose on the FULL path).
+        # Keyed by (source address, padded size, source length): the pad tail
+        # of each entry is written only by creation (zeros), so a shorter
+        # source reusing a wider entry can never leave a stale tail.
+        if len(self._adjust_scratch) > 128:
+            self._adjust_scratch.clear()
+        key = (tensor.data_ptr(), desired_size, tensor.shape[0])
+        buf = self._adjust_scratch.get(key)
+        if (
+            buf is None
+            or buf.shape[1:] != tensor.shape[1:]
+            or buf.dtype != tensor.dtype
+            or buf.device != tensor.device
+        ):
+            buf = torch.zeros(
+                desired_size, *tensor.shape[1:], dtype=tensor.dtype, device=tensor.device
+            )
+            self._adjust_scratch[key] = buf
+        buf[: tensor.shape[0]].copy_(tensor)
+        return buf
 
     def maybe_pad_and_reduce(
         self,
