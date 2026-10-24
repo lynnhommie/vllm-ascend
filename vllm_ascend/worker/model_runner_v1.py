@@ -856,6 +856,22 @@ class NPUModelRunner(GPUModelRunner):
         # avoid corner case of cudagraph config mode FULL to enter the first padding logic
         # e.g. 1 request with 1 token when num_spec > 1 (num_spec = 3 and cudagraph_batch_size = 4 for example)
         # will cause tokens are padded but requests are not
+        # P2 debug (dynamic K): the E5 crash showed stale-span padding after a
+        # K switch (IndexCheck bounds violation in ScatterPaKvCache). Log the
+        # padding inputs under the dynamic-K knob so the next instance session
+        # pinpoints the mismatch (runtime span vs uniform_decode_query_len).
+        if os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K") == "1" and os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_DEBUG") == "1":
+            from vllm.logger import logger
+
+            logger.info(
+                "PADDEBUG num_tokens_padded=%d num_reqs_padded=%d num_reqs=%d "
+                "uniform_decode_query_len=%d mode=%s",
+                num_tokens_padded,
+                num_reqs_padded,
+                num_reqs,
+                self.uniform_decode_query_len,
+                cudagraph_runtime_mode.name if cudagraph_runtime_mode is not None else None,
+            )
         if (
             num_tokens_padded == num_reqs_padded * self.uniform_decode_query_len
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.FULL
