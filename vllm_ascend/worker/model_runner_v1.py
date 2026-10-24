@@ -1101,7 +1101,9 @@ class NPUModelRunner(GPUModelRunner):
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
         if self.num_accepted_tokens_event is not None:
-            self.num_accepted_tokens_event.synchronize()
+            from vllm_ascend.compilation import sync_profiler
+
+            sync_profiler.timed_sync("accepted_tokens_event", self.num_accepted_tokens_event.synchronize)
             # Async mode: condense() reordered indices, use prev_positions mapping
             if self.use_async_scheduling and prev_req_id_to_index:
                 prev_idx = self.prev_positions.np[:num_reqs]
@@ -1448,7 +1450,11 @@ class NPUModelRunner(GPUModelRunner):
         """
         assert self.valid_sampled_token_count_event is not None
         assert self.valid_sampled_token_count_cpu is not None
-        self.valid_sampled_token_count_event.synchronize()
+        from vllm_ascend.compilation import sync_profiler
+
+        sync_profiler.timed_sync(
+            "valid_sampled_token_count_event", self.valid_sampled_token_count_event.synchronize
+        )
         correct_optimistic_seq_lens_cpu(
             self.optimistic_seq_lens_cpu.numpy(),
             self.prev_positions.np,

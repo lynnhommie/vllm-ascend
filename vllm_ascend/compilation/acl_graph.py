@@ -282,7 +282,9 @@ class ACLGraphWrapper:
             and need_sync
             and os.environ.get("VLLM_ASCEND_NO_REPLAY_SYNC") != "1"
         ):
-            torch.npu.current_stream().synchronize()
+            from vllm_ascend.compilation import sync_profiler
+
+            sync_profiler.timed_sync("acl_graph_replay", torch.npu.current_stream().synchronize)
         entry.aclgraph.replay()
         return entry.output
 
