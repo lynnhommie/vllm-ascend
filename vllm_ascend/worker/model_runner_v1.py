@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -1103,7 +1104,17 @@ class NPUModelRunner(GPUModelRunner):
         if self.num_accepted_tokens_event is not None:
             from vllm_ascend.compilation import sync_profiler
 
-            sync_profiler.timed_sync("accepted_tokens_event", self.num_accepted_tokens_event.synchronize)
+            # SYNCPROF measured this sync at ~6ms/iteration on Qwen3.5-MTP
+            # (graph, non-async scheduling) -- the largest single host-side
+            # block in the iteration. The reordered-index consumer below runs
+            # only under async scheduling; in the non-async path the CPU
+            # value is scheduler-maintained, so the barrier may be skippable.
+            # A/B knob (default keeps the barrier): validate with a
+            # correctness smoke + benchx delta before promoting the skip.
+            if os.environ.get("VLLM_ASCEND_SKIP_ACCEPTED_TOKENS_SYNC") != "1":
+                sync_profiler.timed_sync(
+                    "accepted_tokens_event", self.num_accepted_tokens_event.synchronize
+                )
             # Async mode: condense() reordered indices, use prev_positions mapping
             if self.use_async_scheduling and prev_req_id_to_index:
                 prev_idx = self.prev_positions.np[:num_reqs]
