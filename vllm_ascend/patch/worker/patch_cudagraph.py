@@ -11,7 +11,10 @@ def _create_padded_batch_descriptor(
     num_active_loras: int = 0,
 ) -> BatchDescriptor:
     max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
-    uniform_decode_query_len = self.uniform_decode_query_len
+    # Under dynamic speculative decoding the per-request span is the runtime
+    # 1+K (stashed on the runner by the proposer hook), not the config-time
+    # maximum; the stale config span mis-scales num_reqs after a K switch.
+    uniform_decode_query_len = getattr(self, "_dynamic_spec_span", None) or self.uniform_decode_query_len
     num_tokens_padded = self._bs_to_padded_graph_size[num_tokens]
 
     # FULL mode should not be treated as uniform decode

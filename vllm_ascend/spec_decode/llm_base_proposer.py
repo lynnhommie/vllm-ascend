@@ -1060,6 +1060,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
                 self.num_speculative_tokens = step_k
                 self.decode_threshold = 1 + step_k
+            if step_k is not None:
+                # Runtime span for the cudagraph dispatcher's padded-batch
+                # math (see patch_cudagraph): the config span is a stale
+                # maximum under dynamic K.
+                self.runner._dynamic_spec_span = 1 + step_k
 
         if token_indices_to_sample is None:
             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
@@ -1100,7 +1105,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             _, ori_token_indices_to_sample = long_seq_args
 
         has_lora = len(self.runner.input_batch.lora_id_to_lora_request) > 0
-        uniform_decode = target_model_batch_desc.uniform
+        # The draft always decodes a uniform (1+K)-token block per request;
+        # inheriting the target's uniform flag makes mixed prefill+decode
+        # steps dispatch the draft as non-uniform, which drops it out of FULL
+        # into the eager path -- under dynamic K that runs the AOT-compiled
+        # draft (compiled for the config-K shapes) on new shapes and crashes.
+        # Under the dynamic-K knob the draft dispatches as what it is.
+        if _MTP_DYNAMIC_K:
+            uniform_decode = True
+        else:
+            uniform_decode = target_model_batch_desc.uniform
 
         if self.use_cuda_graph:
             aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
