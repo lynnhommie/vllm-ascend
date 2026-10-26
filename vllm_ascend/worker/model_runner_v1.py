@@ -628,6 +628,13 @@ class NPUModelRunner(GPUModelRunner):
             | None
         ) = None
         self.actual_seq_lengths_q: list[int] = []
+        # Runtime per-request span override for dynamic speculative decoding
+        # (see _runtime_decode_span). It has to exist before the first
+        # _dummy_run: startup profiling and graph capture both reach the
+        # uniform-batch detection through _determine_batch_execution_and_padding,
+        # and an AttributeError there aborts EngineCore during startup -- long
+        # before the pre-capture sweep ever logs.
+        self._dynamic_spec_span: int | None = None
         self.decode_token_per_req = 1
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
@@ -871,7 +878,7 @@ class NPUModelRunner(GPUModelRunner):
         (so the draft fell out of its graph) and wrote KV with a stale stride,
         which hung the device at batch > 4 under dynamic K.
         """
-        return self._dynamic_spec_span or self.uniform_decode_query_len
+        return getattr(self, "_dynamic_spec_span", None) or self.uniform_decode_query_len
 
     def _pad_query_start_loc_for_fia(
         self,
