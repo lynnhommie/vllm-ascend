@@ -1119,8 +1119,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # into the eager path -- under dynamic K that runs the AOT-compiled
         # draft (compiled for the config-K shapes) on new shapes and crashes.
         # Under the dynamic-K knob the draft dispatches as what it is.
-        if _MTP_DYNAMIC_K:
-            uniform_decode = True
+        if _MTP_DYNAMIC_K and os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_UNIFORM", "1") == "1":
+            # The draft always decodes a uniform (1+K)-token block per request,
+            # so on a decode-only step it must dispatch as uniform even when the
+            # target's inherited flag says otherwise (mixed prefill+decode steps
+            # set uniform=False, and under dynamic K that dropped the draft out
+            # of FULL into the eager path, where the AOT-compiled draft hit
+            # config-K shapes and crashed).
+            # But on a step that contains a prefill, forcing uniform makes the
+            # draft replay a padded multi-request graph while only one request
+            # has real data -- the metadata mismatch deadlocks the device (T1:
+            # static K, env on, no schedule; hung at the pre-replay stream
+            # synchronize). So force it only for decode-only steps.
+            _state = getattr(common_attn_metadata, "attn_state", None)
+            if _state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding):
+                uniform_decode = True
+            else:
+                uniform_decode = target_model_batch_desc.uniform
         else:
             uniform_decode = target_model_batch_desc.uniform
 
