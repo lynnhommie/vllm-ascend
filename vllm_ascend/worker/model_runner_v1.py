@@ -856,16 +856,20 @@ class NPUModelRunner(GPUModelRunner):
         set_graph_param_span(None if span is None or span == (config_k or 0) + 1 else span)
 
     def _runtime_decode_span(self) -> int:
-        """Per-request token span of the CURRENT step (1 + runtime K).
+        """Per-request token span of the CURRENT step.
 
         Buffer and graph-key sizing must keep the config span (the upper bound),
         but every per-step computation -- uniform-batch detection and the
         attention metadata's ``decode_token_per_req`` (which drives slot_mapping
-        stride, hence the KV-cache write path) -- must follow the runtime K.
-        Using the config span for these made a step that scheduled fewer draft
-        tokens than the config describe itself as non-uniform (so the draft
-        fell out of its graph) and, worse, wrote KV with a stale stride, which
-        hung the device at batch > 4 under dynamic K.
+        stride, hence the KV-cache write path) -- must follow what this step
+        actually scheduled. ``SchedulerOutput.num_spec_tokens_to_schedule`` is
+        the K for the *next* step's drafts (the scheduler derives it from this
+        step's batch size and the drafter consumes it at the end of the step),
+        so it must NOT be used here; ``execute_model`` publishes the actual
+        count, read off ``scheduled_spec_decode_tokens``. The config span made a
+        step that scheduled fewer draft tokens describe itself as non-uniform
+        (so the draft fell out of its graph) and wrote KV with a stale stride,
+        which hung the device at batch > 4 under dynamic K.
         """
         return self._dynamic_spec_span or self.uniform_decode_query_len
 
@@ -1870,27 +1874,37 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        # Dynamic speculative decoding: refresh the runtime per-request span
-        # from the scheduler BEFORE any dispatch in this step. The cudagraph
-        # dispatcher's padded-batch math reads it (patch_cudagraph); a stale
-        # span from the previous step mis-scales num_reqs on K transitions.
+        # Dynamic speculative decoding: publish the per-request span of THIS
+        # step before any dispatch. The cudagraph dispatcher's padded-batch
+        # math, the FIA query_start_loc padding and the attention metadata's
+        # decode_token_per_req (slot_mapping stride, hence the KV-cache write
+        # path) all read it.
         if os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K") == "1":
-            _sched_k = getattr(scheduler_output, "num_spec_tokens_to_schedule", None)
-            if _sched_k is not None:
-                self._set_dynamic_spec_span(_sched_k + 1)
-                # FIA graph params/workspaces/handles are indexed by token
-                # bucket only (GraphParams: dict[int, ...]), so capturing a
-                # second graph into the same bucket for a different span
-                # clobbers the first graph's captured params -- which is what
-                # hung even a pure config-K step right after the pre-capture
-                # sweep. Until the params table is keyed by (bucket, span),
-                # steps whose runtime K differs from the config K stay off
-                # FULL; per-K pre-capture is opt-in via ..._PRECAPTURE=1.
-                _config_k = self.speculative_config.num_speculative_tokens if self.speculative_config else 0
-                self._non_config_k_step = (
-                    _sched_k != _config_k
-                    and os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_PRECAPTURE") != "1"
-                )
+            # This step's span = 1 + the draft count each request was scheduled
+            # with, i.e. what the drafter produced at the END of the previous
+            # step. ``num_spec_tokens_to_schedule`` is NOT that value: the
+            # scheduler derives it from THIS step's batch size and it tells this
+            # step's drafter how many tokens to emit for the NEXT step. Reading
+            # it as this step's span published span=2 on a step whose decode
+            # requests carried 4 tokens, so padding / descriptor / slot stride
+            # all disagreed with the batch -- the conc>4 stall of the
+            # non-pre-capture arm and part of the transition-step failure of the
+            # pre-capture arm (see B.log: scheduled_spec_decode_tokens={req: 3
+            # drafts} together with num_spec_tokens_to_schedule=1).
+            _spec_map = scheduler_output.scheduled_spec_decode_tokens
+            _drafted = max((len(v) for v in _spec_map.values() if v), default=None)
+            self._set_dynamic_spec_span(None if _drafted is None else _drafted + 1)
+            _config_k = self.speculative_config.num_speculative_tokens if self.speculative_config else 0
+            # FIA graph params/workspaces/handles are keyed by (bucket, span)
+            # for non-config spans only, so a second per-K graph cannot clobber
+            # the config-span graph's captured params; a step whose actual span
+            # differs from the config span stays off FULL unless the per-K
+            # pre-capture sweep built that span's graphs at startup.
+            self._non_config_k_step = (
+                _drafted is not None
+                and _drafted != _config_k
+                and os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_PRECAPTURE") != "1"
+            )
 
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
@@ -2151,9 +2165,9 @@ class NPUModelRunner(GPUModelRunner):
                     # Currently, Graph Mode and SP will both pad num_tokens,
                     # Another possible condition is num_tokens_padded != num_tokens_unpadded
                     # but this scope is way too big and the consequences are unpredictable
-                    # Runtime span under dynamic spec: scheduler_output knows
-                    # the per-step K; config span is a stale maximum then.
-                    _spec_k = getattr(scheduler_output, "num_spec_tokens_to_schedule", None) if use_spec_decode else None
+                    # Runtime span under dynamic spec: this step's actual
+                    # per-request token count (published at the top of
+                    # execute_model); the config span is a stale maximum there.
                     num_reqs_padded = self._pad_query_start_loc_for_fia(
                         self.query_start_loc,
                         num_tokens_padded,
@@ -2161,7 +2175,7 @@ class NPUModelRunner(GPUModelRunner):
                         num_reqs,
                         cudagraph_mode,
                         batch_desc.num_reqs,
-                        decode_query_len=(_spec_k + 1) if _spec_k is not None else None,
+                        decode_query_len=self._runtime_decode_span() if use_spec_decode else None,
                     )
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,

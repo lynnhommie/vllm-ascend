@@ -1052,27 +1052,44 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # Default (env unset) keeps the config K: zero behavior change.
         if _MTP_DYNAMIC_K and scheduler_output is not None:
             step_k = getattr(scheduler_output, "num_spec_tokens_to_schedule", None)
-            if step_k is not None and step_k != self.num_speculative_tokens:
-                logger.info(
-                    "dynamic K: %d -> %d (batch spec schedule)",
-                    self.num_speculative_tokens,
-                    step_k,
-                )
-                self.num_speculative_tokens = step_k
-                self.decode_threshold = 1 + step_k
             if step_k is not None:
-                # Runtime span for the cudagraph dispatcher's padded-batch
-                # math (see patch_cudagraph): the config span is a stale
-                # maximum under dynamic K. Published to the dispatcher too --
-                # it keeps its own uniform_decode_query_len.
-                self.runner._set_dynamic_spec_span(1 + step_k)
-                # Draft graphs for a non-config span would collide in the
-                # bucket-indexed FIA param table, so keep such steps off FULL
-                # unless per-K pre-capture is explicitly enabled.
-                self._non_config_k_step = (
-                    step_k != self.speculative_config.num_speculative_tokens
-                    and os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_PRECAPTURE") != "1"
+                _config_k = self.speculative_config.num_speculative_tokens
+                _precapture = os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_PRECAPTURE") == "1"
+                _state = getattr(common_attn_metadata, "attn_state", None)
+                _decode_only = _state in (
+                    AscendAttentionState.DecodeOnly,
+                    AscendAttentionState.SpecDecoding,
                 )
+                # The draft's shape for a step is decided here, one step ahead of
+                # the target that consumes it, so a non-config K is only runnable
+                # when the draft owns artifacts for that K: the startup pre-capture
+                # sweep builds per-K graphs, and it builds them for uniform
+                # decode-only batches only. A step that contains a prefill
+                # dispatches the draft non-uniformly -- its (relaxed, K) entry was
+                # never captured, starting a capture mid-serving is rejected by the
+                # platform (graph_task_group_begin -> 107029 -> dead engine), and
+                # running the AOT-compiled draft on shapes it was not compiled for
+                # fails the same way. Everywhere else the draft keeps the config K:
+                # the schedule then takes hold one step later, which costs a single
+                # transition step and nothing else.
+                draft_k = step_k if (_precapture and _decode_only) else _config_k
+                if draft_k != self.num_speculative_tokens:
+                    logger.info(
+                        "dynamic K: %d -> %d (%s)",
+                        self.num_speculative_tokens,
+                        draft_k,
+                        "batch spec schedule"
+                        if draft_k == step_k
+                        else f"step K={step_k} has no per-K draft graph "
+                        f"(pre-capture={_precapture}, decode-only={_decode_only}); keep config K",
+                    )
+                    self.num_speculative_tokens = draft_k
+                    self.decode_threshold = 1 + draft_k
+                # Runtime span for the cudagraph dispatcher's padded-batch math
+                # (see patch_cudagraph) and the draft's own FIA keying: the
+                # config span is a stale maximum once K moves.
+                self.runner._set_dynamic_spec_span(1 + draft_k)
+                self._non_config_k_step = draft_k != _config_k and not _precapture
 
         if token_indices_to_sample is None:
             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
