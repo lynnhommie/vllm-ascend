@@ -1081,7 +1081,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # require it to be inside the swept set. A non-config K outside it
                 # would fall back to piecewise, and piecewise at a non-config K is
                 # the platform failure mode (uncaptured AOT shapes / 107029).
-                _size_max = int(os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_SIZE_MAX", "0"))
+                _size_max = self.runner._dyn_size_cap()
                 _need = batch_size * (1 + step_k)
                 _bucket = next(
                     (

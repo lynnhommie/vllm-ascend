@@ -1912,7 +1912,7 @@ class NPUModelRunner(GPUModelRunner):
             # whose non-config-span batch lands outside that covered set has no
             # captured graph and must not claim FULL -- a mid-serving capture is
             # rejected by the platform (107029). Keep such steps off FULL.
-            _size_max = int(os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_SIZE_MAX", "0"))
+            _size_max = self._dyn_size_cap()
             _covered = _size_max == 0 or scheduler_output.total_num_scheduled_tokens <= _size_max
             # FIA graph params/workspaces/handles are keyed by (bucket, span)
             # for non-config spans only, so a second per-K graph cannot clobber
@@ -5107,6 +5107,9 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_config=self.kv_cache_config,
                 max_num_reqs=self.max_num_reqs,
             )
+            # Re-lattice the buckets before keys/padded maps are derived from
+            # them, so every scheduled span has a legal bucket.
+            self._align_capture_sizes_to_dynamic_spans()
             self.cudagraph_dispatcher.initialize_cudagraph_keys(
                 cudagraph_mode, self.uniform_decode_query_len
             )
@@ -5138,6 +5141,81 @@ class NPUModelRunner(GPUModelRunner):
             set_graph_params(capture_sizes)
             if self.speculative_config:
                 set_draft_graph_params(capture_sizes)
+
+    def _dyn_size_cap(self) -> int:
+        """Largest bucket the pre-capture sweep covers (0 = every bucket).
+
+        Explicit env wins; otherwise the schedule table's own reach (set while
+        re-latticing the buckets), so the top tier is covered without tuning.
+        Both the sweep and the runtime coverage guard read this, so "is there a
+        graph for this step" is answered by one number.
+        """
+        return int(os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_SIZE_MAX", "0")) or int(
+            getattr(self, "_dyn_sweep_cap", 0) or 0
+        )
+
+    def _align_capture_sizes_to_dynamic_spans(self) -> None:
+        """Put every capture bucket on a lattice divisible by every scheduled span.
+
+        Core sizes the buckets against the single CONFIG span
+        (``adjust_cudagraph_sizes_for_spec_decode``), so with a schedule table
+        that also runs a lower K, a step at that span has no legal bucket and
+        has to be padded into a bigger shape. That padded shape is a different
+        graph from the one the same K captures when it is the config value, and
+        on this platform it is the shape that wedges the device with no error
+        code (E2: silent hang at reqs=2, span=3). A common multiple of all
+        scheduled spans makes every step's natural shape legal -- no padding,
+        and a non-config step replays exactly the graph that K's static run
+        would have used.
+
+        Coarsening only rounds buckets UP, so no batch loses a graph. Runs
+        solely under the dynamic-K + pre-capture knobs: the static path keeps
+        core's own lattice untouched.
+        """
+        spec = self.speculative_config
+        entries = getattr(spec, "num_speculative_tokens_per_batch_size", None) if spec else None
+        if not (
+            _MTP_DYNAMIC_K
+            and os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_PRECAPTURE") == "1"
+            and entries
+        ):
+            return
+        spans = {int(spec.num_speculative_tokens or 0) + 1} | {int(e[2]) + 1 for e in entries if int(e[2]) > 0}
+        lattice = 1
+        for s in sorted(spans):
+            if s > 1:
+                lattice = lattice * s // math.gcd(lattice, s)
+        sizes = self.compilation_config.cudagraph_capture_sizes
+        if not sizes or lattice <= 1 or all(s % lattice == 0 for s in sizes):
+            return
+        # Round up and keep the top: dropping a bucket that overruns the old cap
+        # would leave the largest batches with no graph at all (dispatch then
+        # falls to eager). The overshoot is < lattice tokens.
+        aligned = sorted({math.ceil(s / lattice) * lattice for s in sizes})
+        # Buckets the schedule can actually reach: each tier's batch upper bound
+        # times its span. The pre-capture sweep defaults to this so the top tier
+        # is covered without the operator hand-tuning a size cap.
+        _needed = max((int(e[1]) * (int(e[2]) + 1) for e in entries if int(e[2]) > 0), default=0)
+        # Round the reach up to the lattice as well: after coarsening, the top
+        # tier's batch can need a bucket larger than batch*span (conc=64 at K=1
+        # needs 132, not 128), and a smaller cap would make the coverage guard
+        # fall that tier back to the config K.
+        self._dyn_sweep_cap = math.ceil(_needed / lattice) * lattice if _needed else 0
+        self.compilation_config.cudagraph_capture_sizes = aligned
+        self.compilation_config.max_cudagraph_capture_size = aligned[-1]
+        # The dispatcher derived its bs->bucket map from the old list; rebuild
+        # it now so dispatch and the capture loop agree on the new lattice.
+        dispatcher = getattr(self, "cudagraph_dispatcher", None)
+        if dispatcher is not None:
+            dispatcher._compute_bs_to_padded_graph_size()
+        logger.info(
+            "Dynamic-K pre-capture: capture buckets re-latticed to multiples of %d "
+            "(spans=%s, %d sizes, max %d)",
+            lattice,
+            sorted(spans),
+            len(aligned),
+            aligned[-1],
+        )
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
@@ -5201,7 +5279,7 @@ class NPUModelRunner(GPUModelRunner):
                 # limit the sweep to the largest bucket actually reachable at
                 # this span (VLLM_ASCEND_MTP_DYNAMIC_K_SIZE_MAX, e.g. 128 for
                 # <=64 concurrent requests). 0/unset = sweep every bucket.
-                size_max = int(os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_SIZE_MAX", "0"))
+                size_max = self._dyn_size_cap()
                 dispatcher = getattr(self, "cudagraph_dispatcher", None)
                 saved_disp_span = getattr(dispatcher, "uniform_decode_query_len", None)
                 if dispatcher is not None:
