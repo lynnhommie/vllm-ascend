@@ -1063,8 +1063,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if step_k is not None:
                 # Runtime span for the cudagraph dispatcher's padded-batch
                 # math (see patch_cudagraph): the config span is a stale
-                # maximum under dynamic K.
-                self.runner._dynamic_spec_span = 1 + step_k
+                # maximum under dynamic K. Published to the dispatcher too --
+                # it keeps its own uniform_decode_query_len.
+                self.runner._set_dynamic_spec_span(1 + step_k)
 
         if token_indices_to_sample is None:
             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1

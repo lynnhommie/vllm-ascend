@@ -832,6 +832,21 @@ class NPUModelRunner(GPUModelRunner):
         self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
         return super()._update_states(scheduler_output)
 
+    def _set_dynamic_spec_span(self, span: int | None) -> None:
+        """Publish the runtime per-request span (1 + K) to every consumer.
+
+        The cudagraph dispatcher keeps its own ``uniform_decode_query_len``
+        and the padded-batch descriptor math (``patch_cudagraph``) reads the
+        override off the *dispatcher* instance, so setting it only on the
+        runner leaves the dispatcher dividing by the config-time span -- the
+        two then disagree on num_reqs by the span ratio and input prep fails
+        with a broadcast error.
+        """
+        self._dynamic_spec_span = span
+        dispatcher = getattr(self, "cudagraph_dispatcher", None)
+        if dispatcher is not None:
+            dispatcher._dynamic_spec_span = span
+
     def _pad_query_start_loc_for_fia(
         self,
         query_start_loc: torch.Tensor,
@@ -1840,7 +1855,7 @@ class NPUModelRunner(GPUModelRunner):
         if os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K") == "1":
             _sched_k = getattr(scheduler_output, "num_spec_tokens_to_schedule", None)
             if _sched_k is not None:
-                self._dynamic_spec_span = _sched_k + 1
+                self._set_dynamic_spec_span(_sched_k + 1)
 
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
@@ -5079,7 +5094,7 @@ class NPUModelRunner(GPUModelRunner):
                 # every (bucket, K) capture fail with error 561002.
                 self.uniform_decode_query_len = span
                 self.decode_token_per_req = span
-                self._dynamic_spec_span = span
+                self._set_dynamic_spec_span(span)
                 failed = 0
                 try:
                     for size in self.compilation_config.cudagraph_capture_sizes:
@@ -5116,7 +5131,7 @@ class NPUModelRunner(GPUModelRunner):
                         self.uniform_decode_query_len,
                         self.decode_token_per_req,
                     ) = saved
-                    self._dynamic_spec_span = None
+                    self._set_dynamic_spec_span(None)
                     set_cudagraph_capturing_enabled(False)
                 _logger.info("Dynamic-K pre-capture: K=%d done (%d sizes failed)", k, failed)
 
