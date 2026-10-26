@@ -5101,7 +5101,7 @@ class NPUModelRunner(GPUModelRunner):
                 if entry[2] > 0
             }
             extra_ks = sorted(k for k in schedule_ks if k != self.speculative_config.num_speculative_tokens)
-            from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+            from vllm_ascend.compilation.acl_graph import set_capture_gate
 
             for k in extra_ks:
                 span = k + 1
@@ -5154,7 +5154,7 @@ class NPUModelRunner(GPUModelRunner):
                         # when it returned; reopen it per sweep call (the
                         # monitor's validate would reject the capture
                         # otherwise).
-                        set_cudagraph_capturing_enabled(True)
+                        set_capture_gate(True)
                         try:
                             # Go through the runner's dummy run (not the
                             # drafter's) so the target graphs for this span's
@@ -5187,7 +5187,7 @@ class NPUModelRunner(GPUModelRunner):
                     if dispatcher is not None and saved_disp_span is not None:
                         dispatcher.uniform_decode_query_len = saved_disp_span
                     self._set_dynamic_spec_span(None)
-                    set_cudagraph_capturing_enabled(False)
+                    set_capture_gate(False)
                 _logger.info("Dynamic-K pre-capture: K=%d done (%d sizes failed)", k, failed)
 
         mgr = self.encoder_cudagraph_manager

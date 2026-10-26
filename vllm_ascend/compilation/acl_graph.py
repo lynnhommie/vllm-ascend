@@ -48,6 +48,23 @@ def _is_old_hdk_capture_error(exc: RuntimeError) -> bool:
 
 
 @dataclasses.dataclass
+def set_capture_gate(enabled: bool) -> None:
+    """Open/close the process-wide cudagraph capturing gate.
+
+    Preferred via core's setter; falls back to writing the module global so an
+    older vllm without the setter still works (a top-level import of a missing
+    name would break module load and the whole server with it).
+    """
+    try:
+        from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+
+        set_cudagraph_capturing_enabled(enabled)
+    except ImportError:
+        import vllm.compilation.monitor as _monitor
+
+        _monitor.cudagraph_capturing_enabled = enabled
+
+
 class ACLGraphEntry:
     batch_descriptor: BatchDescriptor
     aclgraph: torch.npu.NPUGraph | None = None
@@ -182,6 +199,16 @@ class ACLGraphWrapper:
                     entry_key,
                     getattr(self.runnable, "__qualname__", type(self.runnable).__name__),
                 )
+                # Under dynamic K the bucket set depends on the schedule, so a
+                # runtime step can legitimately ask for a (bucket, K) entry the
+                # startup sweep did not cover. Core closes the capturing gate
+                # when startup ends, which turned that legitimate lazy capture
+                # into a fatal "capturing at an inappropriate time" error; open
+                # it for the duration of this capture and close it again after
+                # (matching core's post-startup state). The mid-serving capture
+                # that used to hang the device is no longer the failure mode --
+                # that was the prefill-step uniform bug, fixed separately.
+                set_capture_gate(True)
                 import time as _time
 
                 _cap_t0 = _time.perf_counter()
@@ -266,6 +293,7 @@ class ACLGraphWrapper:
                     )
                 except NameError:
                     pass
+                set_capture_gate(False)
 
             compilation_counter.num_cudagraph_captured += 1
 
