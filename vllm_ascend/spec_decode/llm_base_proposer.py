@@ -1148,6 +1148,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 common_attn_metadata.num_reqs,
                 aclgraph_runtime_mode,
                 batch_descriptor.num_reqs,
+                # Runtime span (1 + K): under dynamic K the config span is a
+                # stale maximum and produces out-of-range slot indices.
+                decode_query_len=self.decode_threshold,
             )
             common_attn_metadata.num_reqs = num_reqs_padded
             common_attn_metadata.query_start_loc = self.query_start_loc.gpu[: num_reqs_padded + 1]

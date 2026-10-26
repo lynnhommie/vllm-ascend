@@ -840,13 +840,22 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs: int,
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
         batch_desc_num_reqs: int | None = None,
+        decode_query_len: int | None = None,
     ) -> int:
         """
         This function is only designed to satisfied the constraint that when the layout is TND,
         the first dimension of `hidden_states` must equal the last element of `actual_seq_lengths_q`.
+
+        ``decode_query_len`` overrides the config-time ``uniform_decode_query_len``
+        with the runtime per-request span (1 + K). Under dynamic speculative
+        decoding the scheduler can change K per step; the config span then
+        disagrees with the actual token layout and the padding arithmetic
+        below writes a stale-stride query_start_loc, which the KV-cache write
+        path turns into out-of-range slot indices (IndexCheck trap in
+        ScatterPaKvCache). Callers that know the runtime K pass it; the
+        default keeps the config span (static-K behavior).
         """
-        # TODO: need refactor later, related to vllm PR #34043 this pr delete func
-        # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
+        span = decode_query_len if decode_query_len is not None else self.uniform_decode_query_len
         if cudagraph_runtime_mode == CUDAGraphMode.FULL and \
             self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs_padded = num_reqs
@@ -856,24 +865,21 @@ class NPUModelRunner(GPUModelRunner):
         # avoid corner case of cudagraph config mode FULL to enter the first padding logic
         # e.g. 1 request with 1 token when num_spec > 1 (num_spec = 3 and cudagraph_batch_size = 4 for example)
         # will cause tokens are padded but requests are not
-        # P2 debug (dynamic K): the E5 crash showed stale-span padding after a
-        # K switch (IndexCheck bounds violation in ScatterPaKvCache). Log the
-        # padding inputs under the dynamic-K knob so the next instance session
-        # pinpoints the mismatch (runtime span vs uniform_decode_query_len).
         if os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K") == "1" and os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_DEBUG") == "1":
             from vllm.logger import logger
 
             logger.info(
                 "PADDEBUG num_tokens_padded=%d num_reqs_padded=%d num_reqs=%d "
-                "uniform_decode_query_len=%d mode=%s",
+                "span=%d(config=%d) mode=%s",
                 num_tokens_padded,
                 num_reqs_padded,
                 num_reqs,
+                span,
                 self.uniform_decode_query_len,
                 cudagraph_runtime_mode.name if cudagraph_runtime_mode is not None else None,
             )
         if (
-            num_tokens_padded == num_reqs_padded * self.uniform_decode_query_len
+            num_tokens_padded == num_reqs_padded * span
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.FULL
         ):
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
@@ -881,7 +887,7 @@ class NPUModelRunner(GPUModelRunner):
 
             last_loc = query_start_loc.np[num_reqs]
             query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = (
-                self.arange_np[1 : num_reqs_padded + 1 - num_reqs] * self.uniform_decode_query_len + last_loc
+                self.arange_np[1 : num_reqs_padded + 1 - num_reqs] * span + last_loc
             )
         else:
             # Mixed-batch case: num_reqs must equal num_reqs_padded
@@ -2086,6 +2092,9 @@ class NPUModelRunner(GPUModelRunner):
                     # Currently, Graph Mode and SP will both pad num_tokens,
                     # Another possible condition is num_tokens_padded != num_tokens_unpadded
                     # but this scope is way too big and the consequences are unpredictable
+                    # Runtime span under dynamic spec: scheduler_output knows
+                    # the per-step K; config span is a stale maximum then.
+                    _spec_k = getattr(scheduler_output, "num_spec_tokens_to_schedule", None) if use_spec_decode else None
                     num_reqs_padded = self._pad_query_start_loc_for_fia(
                         self.query_start_loc,
                         num_tokens_padded,
@@ -2093,8 +2102,8 @@ class NPUModelRunner(GPUModelRunner):
                         num_reqs,
                         cudagraph_mode,
                         batch_desc.num_reqs,
+                        decode_query_len=(_spec_k + 1) if _spec_k is not None else None,
                     )
-
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,
