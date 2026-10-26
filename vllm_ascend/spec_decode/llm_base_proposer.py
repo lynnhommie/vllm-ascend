@@ -24,7 +24,9 @@ from vllm.logger import logger
 # the per-step K published by the scheduler (configured via
 # num_speculative_tokens_per_batch_size) overrides the config K, mirroring
 # what upstream's core propose() does for its own callers.
+
 _MTP_DYNAMIC_K = os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K") == "1"
+_MTP_DYN_DEBUG = _MTP_DYNAMIC_K and os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_DEBUG") == "1"
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
@@ -1091,6 +1093,22 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
                 _covered = _bucket is not None and (_size_max == 0 or _bucket <= _size_max)
                 draft_k = step_k if (_precapture and _decode_only and _covered) else _config_k
+                # See the DYNSTEP line on the target side: the last one before a
+                # device trap is the suspect step. Shows the full decision, not
+                # just the outcome, so "K did not move" and "K moved onto a graph
+                # that was not there" are distinguishable from one log file.
+                if _MTP_DYN_DEBUG and step_k != _config_k:
+                    logger.info(
+                        "DYNSTEP draft reqs=%d sched_k=%d draft_k=%d decode_only=%s "
+                        "precapture=%s bucket=%s size_max=%d",
+                        batch_size,
+                        step_k,
+                        draft_k,
+                        _decode_only,
+                        _precapture,
+                        _bucket,
+                        _size_max,
+                    )
                 if draft_k != self.num_speculative_tokens:
                     logger.info(
                         "dynamic K: %d -> %d (%s)",

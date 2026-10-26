@@ -231,6 +231,11 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 
 
+
+# Dynamic speculative decoding: DYNSTEP forensics (off unless both flags set).
+_MTP_DYNAMIC_K = os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K") == "1"
+_MTP_DYN_DEBUG = _MTP_DYNAMIC_K and os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_DEBUG") == "1"
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -1920,6 +1925,24 @@ class NPUModelRunner(GPUModelRunner):
                 and _drafted != _config_k
                 and (not _precapture or not _covered)
             )
+            # Device-side traps surface asynchronously (the aivec/507035 dump
+            # arrives at whichever host wait comes next), so the last line of
+            # this kind before a crash names the step whose shape poisoned the
+            # queue. DEBUG only: logging at ~ms/step would itself perturb the
+            # numbers we are trying to read.
+            if (
+                _MTP_DYN_DEBUG
+                and _drafted is not None
+                and _drafted != _config_k
+            ):
+                logger.info(
+                    "DYNSTEP target reqs=%s drafted=%d span=%d total=%d off_full=%s",
+                    None if self.input_batch is None else self.input_batch.num_reqs,
+                    _drafted,
+                    _drafted + 1,
+                    scheduler_output.total_num_scheduled_tokens,
+                    self._non_config_k_step,
+                )
 
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
