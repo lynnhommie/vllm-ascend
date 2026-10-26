@@ -42,12 +42,6 @@ def _is_stream_resource_capture_error(exc: RuntimeError) -> bool:
     return has_stream_resource_marker or (has_error_code and "stream resource" in lowered_message)
 
 
-def _is_old_hdk_capture_error(exc: RuntimeError) -> bool:
-    message = str(exc).lower()
-    return any(marker in message for marker in _OLD_HDK_CAPTURE_ERROR_MARKERS)
-
-
-@dataclasses.dataclass
 def set_capture_gate(enabled: bool) -> None:
     """Open/close the process-wide cudagraph capturing gate.
 
@@ -65,6 +59,12 @@ def set_capture_gate(enabled: bool) -> None:
         _monitor.cudagraph_capturing_enabled = enabled
 
 
+def _is_old_hdk_capture_error(exc: RuntimeError) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _OLD_HDK_CAPTURE_ERROR_MARKERS)
+
+
+@dataclasses.dataclass
 class ACLGraphEntry:
     batch_descriptor: BatchDescriptor
     aclgraph: torch.npu.NPUGraph | None = None
