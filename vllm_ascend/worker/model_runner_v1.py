@@ -5111,8 +5111,17 @@ class NPUModelRunner(GPUModelRunner):
                         self.compilation_config.cudagraph_mode, span
                     )
                 failed = 0
+                # Optional cap on the swept buckets: graph pool memory is
+                # taken from the headroom left after the KV cache is sized
+                # (KV is allocated before capture), so on a tight HBM budget
+                # limit the sweep to the largest bucket actually reachable at
+                # this span (VLLM_ASCEND_MTP_DYNAMIC_K_SIZE_MAX, e.g. 128 for
+                # <=64 concurrent requests). 0/unset = sweep every bucket.
+                size_max = int(os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_SIZE_MAX", "0"))
                 try:
                     for size in self.compilation_config.cudagraph_capture_sizes:
+                        if size_max and size > size_max:
+                            break  # capture sizes are ascending
                         if size % span != 0:
                             continue
                         # The core capture phase closed the capturing gate
