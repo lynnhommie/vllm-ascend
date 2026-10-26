@@ -57,6 +57,7 @@ from vllm_ascend.compilation.acl_graph import (
     get_draft_graph_params,
     get_draft_graph_prefill_params,
     get_graph_params,
+    graph_param_key,
     update_draft_graph_params_workspaces,
     update_graph_params_workspaces,
 )
@@ -510,12 +511,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     graph_params = get_draft_graph_params()
             else:
                 graph_params = get_graph_params()
+            _gp_key = graph_param_key(num_tokens)
             with torch.npu.stream(update_stream):
                 for key, param, handle, event in zip(
                     forward_context.attn_metadata,
-                    graph_params.attn_params[num_tokens],
-                    graph_params.handles[num_tokens],
-                    graph_params.events[num_tokens],
+                    graph_params.attn_params.get(_gp_key, []),
+                    graph_params.handles.get(_gp_key, []),
+                    graph_params.events.get(_gp_key, []),
                 ):
                     (
                         query,
@@ -581,11 +583,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
             num_layers = len(attn_keys)
             if num_layers == 0:
                 return
-            captured_attn_params = graph_params.attn_params[num_tokens]
-            handles = graph_params.handles[num_tokens]
-            events = graph_params.events[num_tokens]
+            captured_attn_params = graph_params.attn_params.get(graph_param_key(num_tokens), [])
+            handles = graph_params.handles.get(graph_param_key(num_tokens), [])
+            events = graph_params.events.get(graph_param_key(num_tokens), [])
             graph_param_count = len(captured_attn_params)
-            workspace = graph_params.workspaces.get(num_tokens)
+            workspace = graph_params.workspaces.get(graph_param_key(num_tokens))
             if _EXTRA_CTX.is_draft_model:
                 if graph_param_count > len(draft_attn_key_steps):
                     repeat_count = cdiv(graph_param_count, len(draft_attn_key_steps))
@@ -685,7 +687,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     # increasing by layer index, so need regular expressions to
                     # reorder the attn_keys and store the results in
                     # _ATTN_KEYS_BUFFER.
-                    attn_keys_length = len(graph_params.attn_params[num_tokens])
+                    attn_keys_length = len(graph_params.attn_params.get(graph_param_key(num_tokens), []))
                     global _ATTN_KEYS_BUFFER
                     if attn_keys_length == 0:
                         return
@@ -730,11 +732,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
             num_layers = len(attn_keys)
             if num_layers == 0:
                 return
-            captured_attn_params = graph_params.attn_params[num_tokens]
-            handles = graph_params.handles[num_tokens]
-            events = graph_params.events[num_tokens]
+            captured_attn_params = graph_params.attn_params.get(graph_param_key(num_tokens), [])
+            handles = graph_params.handles.get(graph_param_key(num_tokens), [])
+            events = graph_params.events.get(graph_param_key(num_tokens), [])
             graph_param_count = len(captured_attn_params)
-            workspace = graph_params.workspaces.get(num_tokens)
+            workspace = graph_params.workspaces.get(graph_param_key(num_tokens))
             if _EXTRA_CTX.is_draft_model:
                 if graph_param_count > len(draft_attn_key_steps):
                     repeat_count = cdiv(graph_param_count, len(draft_attn_key_steps))
@@ -976,7 +978,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         event = torch.npu.ExternalEvent()
         event.wait(stream)
         event.reset(stream)
-        graph_params.events[num_tokens].append(event)
+        graph_params.events.setdefault(graph_param_key(num_tokens), []).append(event)
         attn_params = (
             weak_ref_tensors(query),
             weak_ref_tensors(key),
@@ -1006,7 +1008,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_params = attn_params + (None, None, None, None)  # type: ignore
         layer_name = self._graph_metadata_layer_name(layer) if self._use_layer_aware_fia_graph_replay else None
         attn_params = attn_params + (layer_name,)  # type: ignore
-        graph_params.attn_params[num_tokens].append(attn_params)
+        graph_params.attn_params.setdefault(graph_param_key(num_tokens), []).append(attn_params)
 
         torch.npu.graph_task_group_begin(stream)
         torch_npu.npu_fused_infer_attention_score.out(
@@ -1033,7 +1035,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output = output.view(num_tokens, self.num_heads, self.head_size)
 
         handle = torch.npu.graph_task_group_end(stream)
-        graph_params.handles[num_tokens].append(handle)
+        graph_params.handles.setdefault(graph_param_key(num_tokens), []).append(handle)
         return output, num_tokens
 
     def full_graph_fia_v2(
@@ -1117,8 +1119,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         event = torch.npu.ExternalEvent()
         event.wait(stream)
         event.reset(stream)
-        graph_params.events[num_tokens].append(event)
-        graph_params.attn_params[num_tokens].append(
+        graph_params.events.setdefault(graph_param_key(num_tokens), []).append(event)
+        graph_params.attn_params.setdefault(graph_param_key(num_tokens), []).append(
             (
                 weak_ref_tensors(query),
                 weak_ref_tensors(key),
@@ -1159,7 +1161,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             out=[output, softmax_lse],
         )
         handle = torch.npu.graph_task_group_end(stream)
-        graph_params.handles[num_tokens].append(handle)
+        graph_params.handles.setdefault(graph_param_key(num_tokens), []).append(handle)
         return output, num_tokens
 
     def full_graph_pa(
@@ -1193,8 +1195,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             event = torch.npu.ExternalEvent()
             event.wait(stream)
             event.reset(stream)
-            graph_params.events[num_tokens].append(event)
-            graph_params.attn_params[num_tokens].append(
+            graph_params.events.setdefault(graph_param_key(num_tokens), []).append(event)
+            graph_params.attn_params.setdefault(graph_param_key(num_tokens), []).append(
                 PagedAttentionGraphParam(
                     (
                         weak_ref_tensors(query),
@@ -1225,7 +1227,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 workspace=workspace,
             )
             handle = torch.npu.graph_task_group_end(stream)
-            graph_params.handles[num_tokens].append(handle)
+            graph_params.handles.setdefault(graph_param_key(num_tokens), []).append(handle)
             return output
 
     def _get_fia_params(self, key: torch.Tensor, value: torch.Tensor, attn_metadata: AscendMetadata, kv_cache=None):

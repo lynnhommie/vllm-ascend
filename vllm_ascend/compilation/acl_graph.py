@@ -374,6 +374,41 @@ def _new_graph_params(aclgraph_capture_sizes: list[int]) -> GraphParams:
     )
 
 
+# ---------------------------------------------------------------------------
+# Graph-param bucket keys under dynamic speculative decoding
+# ---------------------------------------------------------------------------
+# The tables above are indexed by token bucket only, which hard-codes the
+# assumption "one graph per bucket". Dynamic K needs a second graph in the
+# same bucket (4 reqs x K=1 and 2 reqs x K=3 are both 8 tokens): appending its
+# captured FIA params into the same list makes the replay-time layer count
+# (len(attn_params[num_tokens])) wrong, so metadata gets written into another
+# graph's captured tasks -- which hangs the device with no host-side error.
+#
+# Add the per-request span (1 + K) to the key. The config span maps back to
+# the legacy int key, so the static path, every other attention backend (which
+# never sets a span) and the standard capture sweep are all bit-for-bit
+# unaffected; only non-config spans get the tuple key.
+_graph_param_span: int | None = None
+
+
+def set_graph_param_span(span: int | None) -> None:
+    """Record the per-request span (1 + K) of the current step/phase.
+
+    ``None`` means "the config span" and keeps the legacy int-only key.
+    """
+    global _graph_param_span
+    _graph_param_span = span
+
+
+def get_graph_param_span() -> int | None:
+    return _graph_param_span
+
+
+def graph_param_key(num_tokens: int):
+    """Key for the graph-param tables of this bucket under the current span."""
+    return (num_tokens, _graph_param_span) if _graph_param_span is not None else num_tokens
+
+
 def _select_graph_params(params: GraphParams | GraphParamsByLoRA | None) -> GraphParams | None:
     if params is None or not isinstance(params, dict):
         return params
@@ -409,7 +444,7 @@ def set_graph_params(aclgraph_capture_sizes: list[int]):
 def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor):
     graph_params = get_graph_params()
     if graph_params is not None:
-        graph_params.workspaces[num_tokens] = workspace
+        graph_params.workspaces[graph_param_key(num_tokens)] = workspace
 
 
 def get_graph_params():
@@ -429,7 +464,7 @@ def set_draft_graph_params(aclgraph_capture_sizes: list[int]):
 def update_draft_graph_params_workspaces(num_tokens: int, workspace: Any):
     graph_params = get_draft_graph_params()
     if graph_params is not None:
-        graph_params.workspaces[num_tokens] = workspace
+        graph_params.workspaces[graph_param_key(num_tokens)] = workspace
 
 
 def get_draft_graph_params():
@@ -449,7 +484,7 @@ def set_draft_graph_prefill_params(aclgraph_capture_sizes: list[int]):
 def update_draft_graph_prefill_params_workspaces(num_tokens: int, workspace: Any):
     graph_params = get_draft_graph_prefill_params()
     if graph_params is not None:
-        graph_params.workspaces[num_tokens] = workspace
+        graph_params.workspaces[graph_param_key(num_tokens)] = workspace
 
 
 def get_draft_graph_prefill_params():

@@ -846,6 +846,14 @@ class NPUModelRunner(GPUModelRunner):
         dispatcher = getattr(self, "cudagraph_dispatcher", None)
         if dispatcher is not None:
             dispatcher._dynamic_spec_span = span
+        # Key the FIA graph-param tables by (bucket, span) for non-config spans
+        # so a second per-K graph cannot clobber the config-span graph's
+        # captured params. The config span maps to None = the legacy int key,
+        # keeping the static path and all other backends bit-for-bit unchanged.
+        from vllm_ascend.compilation.acl_graph import set_graph_param_span
+
+        config_k = self.speculative_config.num_speculative_tokens if self.speculative_config else None
+        set_graph_param_span(None if span is None or span == (config_k or 0) + 1 else span)
 
     def _pad_query_start_loc_for_fia(
         self,
