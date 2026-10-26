@@ -855,6 +855,20 @@ class NPUModelRunner(GPUModelRunner):
         config_k = self.speculative_config.num_speculative_tokens if self.speculative_config else None
         set_graph_param_span(None if span is None or span == (config_k or 0) + 1 else span)
 
+    def _runtime_decode_span(self) -> int:
+        """Per-request token span of the CURRENT step (1 + runtime K).
+
+        Buffer and graph-key sizing must keep the config span (the upper bound),
+        but every per-step computation -- uniform-batch detection and the
+        attention metadata's ``decode_token_per_req`` (which drives slot_mapping
+        stride, hence the KV-cache write path) -- must follow the runtime K.
+        Using the config span for these made a step that scheduled fewer draft
+        tokens than the config describe itself as non-uniform (so the draft
+        fell out of its graph) and, worse, wrote KV with a stale stride, which
+        hung the device at batch > 4 under dynamic K.
+        """
+        return self._dynamic_spec_span or self.uniform_decode_query_len
+
     def _pad_query_start_loc_for_fia(
         self,
         query_start_loc: torch.Tensor,
@@ -2867,7 +2881,7 @@ class NPUModelRunner(GPUModelRunner):
         uniform_decode = (
             (
                 (is_all_decode if self.speculative_config else True)
-                and (max_num_scheduled_tokens == self.uniform_decode_query_len)
+                and (max_num_scheduled_tokens == self._runtime_decode_span())
                 and (num_tokens == max_num_scheduled_tokens * num_reqs)
             )
             if force_uniform_decode is None
@@ -3098,7 +3112,7 @@ class NPUModelRunner(GPUModelRunner):
             positions=self.positions,
             positions_cpu=self._dsa_positions_cpu_buf if self.use_compress else None,
             attn_state=self.attn_state,
-            decode_token_per_req=self.decode_token_per_req,
+            decode_token_per_req=self._runtime_decode_span(),
             context_parallel_metadata=self.long_seq_metadata,
             group_len = self.group_len.gpu[:num_reqs_padded],
             group_key_idx = self.group_key_idx.gpu[:num_reqs_padded],
