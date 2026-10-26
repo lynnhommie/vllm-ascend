@@ -1072,7 +1072,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # fails the same way. Everywhere else the draft keeps the config K:
                 # the schedule then takes hold one step later, which costs a single
                 # transition step and nothing else.
-                draft_k = step_k if (_precapture and _decode_only) else _config_k
+                # Coverage test for the swept buckets: the sweep can be capped
+                # (SIZE_MAX) and only captures buckets divisible by the span, so
+                # ask for the bucket the draft dispatch would actually pick (pad
+                # to a capture size, then up to the next multiple of the span) and
+                # require it to be inside the swept set. A non-config K outside it
+                # would fall back to piecewise, and piecewise at a non-config K is
+                # the platform failure mode (uncaptured AOT shapes / 107029).
+                _size_max = int(os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_SIZE_MAX", "0"))
+                _need = batch_size * (1 + step_k)
+                _bucket = next(
+                    (
+                        s
+                        for s in self.runner.compilation_config.cudagraph_capture_sizes
+                        if s % (1 + step_k) == 0 and s >= _need
+                    ),
+                    None,
+                )
+                _covered = _bucket is not None and (_size_max == 0 or _bucket <= _size_max)
+                draft_k = step_k if (_precapture and _decode_only and _covered) else _config_k
                 if draft_k != self.num_speculative_tokens:
                     logger.info(
                         "dynamic K: %d -> %d (%s)",

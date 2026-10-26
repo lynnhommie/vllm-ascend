@@ -1902,15 +1902,23 @@ class NPUModelRunner(GPUModelRunner):
             _drafted = max((len(v) for v in _spec_map.values() if v), default=None)
             self._set_dynamic_spec_span(None if _drafted is None else _drafted + 1)
             _config_k = self.speculative_config.num_speculative_tokens if self.speculative_config else 0
+            # The pre-capture sweep can be capped (SIZE_MAX) to fit the graph
+            # pool, and it only registers buckets divisible by the span. A step
+            # whose non-config-span batch lands outside that covered set has no
+            # captured graph and must not claim FULL -- a mid-serving capture is
+            # rejected by the platform (107029). Keep such steps off FULL.
+            _size_max = int(os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_SIZE_MAX", "0"))
+            _covered = _size_max == 0 or scheduler_output.total_num_scheduled_tokens <= _size_max
             # FIA graph params/workspaces/handles are keyed by (bucket, span)
             # for non-config spans only, so a second per-K graph cannot clobber
             # the config-span graph's captured params; a step whose actual span
             # differs from the config span stays off FULL unless the per-K
             # pre-capture sweep built that span's graphs at startup.
+            _precapture = os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_PRECAPTURE") == "1"
             self._non_config_k_step = (
                 _drafted is not None
                 and _drafted != _config_k
-                and os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_PRECAPTURE") != "1"
+                and (not _precapture or not _covered)
             )
 
         if self.vllm_config.model_config.enable_return_routed_experts:
@@ -5164,14 +5172,6 @@ class NPUModelRunner(GPUModelRunner):
                 # set, so re-initializing adds this span's keys and keeps the
                 # config span's. Runtime dispatch needs them too (a K switch
                 # must find FULL, not lazily capture mid-serving).
-                dispatcher = getattr(self, "cudagraph_dispatcher", None)
-                saved_disp_span = getattr(dispatcher, "uniform_decode_query_len", None)
-                if dispatcher is not None:
-                    dispatcher.uniform_decode_query_len = span
-                    dispatcher.initialize_cudagraph_keys(
-                        self.compilation_config.cudagraph_mode, span
-                    )
-                failed = 0
                 # Optional cap on the swept buckets: graph pool memory is
                 # taken from the headroom left after the KV cache is sized
                 # (KV is allocated before capture), so on a tight HBM budget
@@ -5179,6 +5179,35 @@ class NPUModelRunner(GPUModelRunner):
                 # this span (VLLM_ASCEND_MTP_DYNAMIC_K_SIZE_MAX, e.g. 128 for
                 # <=64 concurrent requests). 0/unset = sweep every bucket.
                 size_max = int(os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_SIZE_MAX", "0"))
+                dispatcher = getattr(self, "cudagraph_dispatcher", None)
+                saved_disp_span = getattr(dispatcher, "uniform_decode_query_len", None)
+                if dispatcher is not None:
+                    dispatcher.uniform_decode_query_len = span
+                    # Register exactly the buckets this sweep captures, instead
+                    # of calling core's initialize_cudagraph_keys for this span:
+                    # that helper iterates *every* capture size, and for a span
+                    # the config never sized the list for (span=3 over
+                    # 4/8/16/...) it either trips its divisibility assert or, once
+                    # padded, registers buckets above the swept cap -- which
+                    # dispatch would then happily route to FULL for a graph that
+                    # does not exist, and a mid-serving capture is fatal here
+                    # (107029). Keys accumulate in a set, so the config span's
+                    # keys stay.
+                    max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+                    for size in self.compilation_config.cudagraph_capture_sizes:
+                        if size % span or (size_max and size > size_max):
+                            continue
+                        dispatcher.add_cudagraph_key(
+                            CUDAGraphMode.FULL,
+                            BatchDescriptor(
+                                num_tokens=size,
+                                num_reqs=min(size // span, max_num_seqs),
+                                uniform=True,
+                                has_lora=False,
+                                num_active_loras=0,
+                            ),
+                        )
+                failed = 0
                 try:
                     for size in self.compilation_config.cudagraph_capture_sizes:
                         if size_max and size > size_max:
