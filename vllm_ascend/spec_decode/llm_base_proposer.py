@@ -1066,6 +1066,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # maximum under dynamic K. Published to the dispatcher too --
                 # it keeps its own uniform_decode_query_len.
                 self.runner._set_dynamic_spec_span(1 + step_k)
+                # Draft graphs for a non-config span would collide in the
+                # bucket-indexed FIA param table, so keep such steps off FULL
+                # unless per-K pre-capture is explicitly enabled.
+                self._non_config_k_step = (
+                    step_k != self.speculative_config.num_speculative_tokens
+                    and os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_PRECAPTURE") != "1"
+                )
 
         if token_indices_to_sample is None:
             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
@@ -1119,7 +1126,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         if self.use_cuda_graph:
             aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
-                num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=has_lora
+                num_tokens=num_tokens,
+                uniform_decode=uniform_decode,
+                has_lora=has_lora,
+                invalid_modes=(
+                    {CUDAGraphMode.FULL} if getattr(self, "_non_config_k_step", False) else None
+                ),
             )
             num_input_tokens = batch_descriptor.num_tokens
         else:
@@ -1143,7 +1155,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
             if self.use_cuda_graph:
                 aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
-                    num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora
+                    num_tokens=num_input_tokens,
+                    uniform_decode=uniform_decode,
+                    has_lora=has_lora,
+                    invalid_modes=(
+                        {CUDAGraphMode.FULL} if getattr(self, "_non_config_k_step", False) else None
+                    ),
                 )
                 num_input_tokens = batch_descriptor.num_tokens
 

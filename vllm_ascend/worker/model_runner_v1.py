@@ -1856,6 +1856,19 @@ class NPUModelRunner(GPUModelRunner):
             _sched_k = getattr(scheduler_output, "num_spec_tokens_to_schedule", None)
             if _sched_k is not None:
                 self._set_dynamic_spec_span(_sched_k + 1)
+                # FIA graph params/workspaces/handles are indexed by token
+                # bucket only (GraphParams: dict[int, ...]), so capturing a
+                # second graph into the same bucket for a different span
+                # clobbers the first graph's captured params -- which is what
+                # hung even a pure config-K step right after the pre-capture
+                # sweep. Until the params table is keyed by (bucket, span),
+                # steps whose runtime K differs from the config K stay off
+                # FULL; per-K pre-capture is opt-in via ..._PRECAPTURE=1.
+                _config_k = self.speculative_config.num_speculative_tokens if self.speculative_config else 0
+                self._non_config_k_step = (
+                    _sched_k != _config_k
+                    and os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_PRECAPTURE") != "1"
+                )
 
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
@@ -2872,7 +2885,11 @@ class NPUModelRunner(GPUModelRunner):
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
                 valid_modes=valid_modes,
-                invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                invalid_modes=(
+                    {CUDAGraphMode.FULL}
+                    if (disable_full or getattr(self, "_non_config_k_step", False))
+                    else None
+                ),
                 num_active_loras=num_active_loras,
             )
 
@@ -5063,6 +5080,7 @@ class NPUModelRunner(GPUModelRunner):
         # dummy sweep over the sizes divisible by that K's span.
         if (
             os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K") == "1"
+            and os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K_PRECAPTURE") == "1"
             and self.speculative_config is not None
             and self.drafter is not None
             and self.speculative_config.num_speculative_tokens_per_batch_size is not None
