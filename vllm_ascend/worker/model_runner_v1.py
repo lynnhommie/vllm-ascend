@@ -1833,6 +1833,15 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # Dynamic speculative decoding: refresh the runtime per-request span
+        # from the scheduler BEFORE any dispatch in this step. The cudagraph
+        # dispatcher's padded-batch math reads it (patch_cudagraph); a stale
+        # span from the previous step mis-scales num_reqs on K transitions.
+        if os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K") == "1":
+            _sched_k = getattr(scheduler_output, "num_spec_tokens_to_schedule", None)
+            if _sched_k is not None:
+                self._dynamic_spec_span = _sched_k + 1
+
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
@@ -5029,6 +5038,53 @@ class NPUModelRunner(GPUModelRunner):
         parent_module_name = _get_gpu_model_runner_module_name(self)
         with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
             cuda_graph_size = GPUModelRunner.capture_model(self)
+
+        # P4.2: pre-capture draft graphs for the non-config K values of the
+        # dynamic schedule. The standard sweep above only captured
+        # (bucket, config-K) entries; at runtime a K switch would lazily
+        # capture mid-serving, which deadlocks (capture needs quiet streams
+        # while in-flight work exists). Capture each extra K here in the
+        # safe startup phase by rebinding the drafter's K and running its
+        # dummy sweep over the sizes divisible by that K's span.
+        if (
+            os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K") == "1"
+            and self.speculative_config is not None
+            and self.drafter is not None
+            and self.speculative_config.num_speculative_tokens_per_batch_size is not None
+        ):
+            from vllm.logger import logger as _logger
+
+            schedule_ks = {
+                entry[2]
+                for entry in self.speculative_config.num_speculative_tokens_per_batch_size
+                if entry[2] > 0
+            }
+            extra_ks = sorted(k for k in schedule_ks if k != self.speculative_config.num_speculative_tokens)
+            for k in extra_ks:
+                span = k + 1
+                _logger.info("Dynamic-K pre-capture: sweeping draft graphs for K=%d", k)
+                saved = (self.drafter.num_speculative_tokens, self.drafter.decode_threshold)
+                self.drafter.num_speculative_tokens = k
+                self.drafter.decode_threshold = span
+                self._dynamic_spec_span = span
+                try:
+                    for size in self.compilation_config.cudagraph_capture_sizes:
+                        if size % span != 0:
+                            continue
+                        num_reqs = size // span
+                        self.drafter.dummy_run(
+                            num_tokens=size,
+                            num_reqs=num_reqs,
+                            aclgraph_runtime_mode=CUDAGraphMode.FULL,
+                            batch_descriptor=BatchDescriptor(
+                                num_tokens=size, num_reqs=num_reqs, uniform=True
+                            ),
+                            in_graph_capturing=True,
+                        )
+                finally:
+                    self.drafter.num_speculative_tokens, self.drafter.decode_threshold = saved
+                    self._dynamic_spec_span = None
+                _logger.info("Dynamic-K pre-capture: K=%d done", k)
 
         mgr = self.encoder_cudagraph_manager
         if mgr is not None and hasattr(self, "update_stream"):
