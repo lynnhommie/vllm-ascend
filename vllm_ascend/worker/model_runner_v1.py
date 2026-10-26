@@ -5065,35 +5065,60 @@ class NPUModelRunner(GPUModelRunner):
             for k in extra_ks:
                 span = k + 1
                 _logger.info("Dynamic-K pre-capture: sweeping draft graphs for K=%d", k)
-                saved = (self.drafter.num_speculative_tokens, self.drafter.decode_threshold)
+                saved = (
+                    self.drafter.num_speculative_tokens,
+                    self.drafter.decode_threshold,
+                    self.uniform_decode_query_len,
+                    self.decode_token_per_req,
+                )
                 self.drafter.num_speculative_tokens = k
                 self.drafter.decode_threshold = span
+                # The runner-level span drives query_start_loc /
+                # actual_seq_lengths_q, which the FIA TND layout requires to
+                # agree with num_tokens; leaving them at the config span makes
+                # every (bucket, K) capture fail with error 561002.
+                self.uniform_decode_query_len = span
+                self.decode_token_per_req = span
                 self._dynamic_spec_span = span
+                failed = 0
                 try:
                     for size in self.compilation_config.cudagraph_capture_sizes:
                         if size % span != 0:
                             continue
-                        num_reqs = size // span
                         # The core capture phase closed the capturing gate
                         # when it returned; reopen it per sweep call (the
                         # monitor's validate would reject the capture
-                        # otherwise -- observed as the last capture failing
-                        # after ~1800 successful ones).
+                        # otherwise).
                         set_cudagraph_capturing_enabled(True)
-                        self.drafter.dummy_run(
-                            num_tokens=size,
-                            num_reqs=num_reqs,
-                            aclgraph_runtime_mode=CUDAGraphMode.FULL,
-                            batch_descriptor=BatchDescriptor(
-                                num_tokens=size, num_reqs=num_reqs, uniform=True
-                            ),
-                            in_graph_capturing=True,
-                        )
+                        try:
+                            # Go through the runner's dummy run (not the
+                            # drafter's) so the target graphs for this span's
+                            # descriptors and all shared input buffers are
+                            # prepared consistently.
+                            self._dummy_run(
+                                size,
+                                uniform_decode=True,
+                                cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                                is_graph_capturing=True,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            failed += 1
+                            _logger.warning(
+                                "Dynamic-K pre-capture: size=%d K=%d failed: %s",
+                                size,
+                                k,
+                                exc,
+                            )
                 finally:
-                    self.drafter.num_speculative_tokens, self.drafter.decode_threshold = saved
+                    (
+                        self.drafter.num_speculative_tokens,
+                        self.drafter.decode_threshold,
+                        self.uniform_decode_query_len,
+                        self.decode_token_per_req,
+                    ) = saved
                     self._dynamic_spec_span = None
                     set_cudagraph_capturing_enabled(False)
-                _logger.info("Dynamic-K pre-capture: K=%d done", k)
+                _logger.info("Dynamic-K pre-capture: K=%d done (%d sizes failed)", k, failed)
 
         mgr = self.encoder_cudagraph_manager
         if mgr is not None and hasattr(self, "update_stream"):
