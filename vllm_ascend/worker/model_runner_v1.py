@@ -5060,6 +5060,8 @@ class NPUModelRunner(GPUModelRunner):
                 if entry[2] > 0
             }
             extra_ks = sorted(k for k in schedule_ks if k != self.speculative_config.num_speculative_tokens)
+            from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+
             for k in extra_ks:
                 span = k + 1
                 _logger.info("Dynamic-K pre-capture: sweeping draft graphs for K=%d", k)
@@ -5072,6 +5074,12 @@ class NPUModelRunner(GPUModelRunner):
                         if size % span != 0:
                             continue
                         num_reqs = size // span
+                        # The core capture phase closed the capturing gate
+                        # when it returned; reopen it per sweep call (the
+                        # monitor's validate would reject the capture
+                        # otherwise -- observed as the last capture failing
+                        # after ~1800 successful ones).
+                        set_cudagraph_capturing_enabled(True)
                         self.drafter.dummy_run(
                             num_tokens=size,
                             num_reqs=num_reqs,
@@ -5084,6 +5092,7 @@ class NPUModelRunner(GPUModelRunner):
                 finally:
                     self.drafter.num_speculative_tokens, self.drafter.decode_threshold = saved
                     self._dynamic_spec_span = None
+                    set_cudagraph_capturing_enabled(False)
                 _logger.info("Dynamic-K pre-capture: K=%d done", k)
 
         mgr = self.encoder_cudagraph_manager
