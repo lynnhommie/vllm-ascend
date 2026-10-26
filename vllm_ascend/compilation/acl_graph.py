@@ -171,6 +171,20 @@ class ACLGraphWrapper:
                 # shape. E.g. we only log it for the first subgraph in
                 # piecewise mode.
                 logger.debug("Capturing a aclgraph on (%s,%s)", self.runtime_mode.name, entry.batch_descriptor)
+            # Lazy-capture observability (P4.0): a mid-serving capture is the
+            # suspected deadlock site under dynamic K (hang with the device
+            # spinning, no progress). INFO lines around the capture bracket
+            # it so the next run shows exactly whether the host is inside
+            # graph capture when it stalls.
+            if os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K") == "1":
+                logger.info(
+                    "ACLGRAPH lazy capture BEGIN entry_key=%s runnable=%s",
+                    entry_key,
+                    getattr(self.runnable, "__qualname__", type(self.runnable).__name__),
+                )
+                import time as _time
+
+                _cap_t0 = _time.perf_counter()
             # validate that aclgraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
 
@@ -243,6 +257,15 @@ class ACLGraphWrapper:
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.aclgraph = aclgraph
+            if os.environ.get("VLLM_ASCEND_MTP_DYNAMIC_K") == "1":
+                try:
+                    logger.info(
+                        "ACLGRAPH lazy capture END entry_key=%s took=%.1fs",
+                        entry_key,
+                        _time.perf_counter() - _cap_t0,
+                    )
+                except NameError:
+                    pass
 
             compilation_counter.num_cudagraph_captured += 1
 
