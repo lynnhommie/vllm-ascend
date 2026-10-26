@@ -5095,6 +5095,21 @@ class NPUModelRunner(GPUModelRunner):
                 self.uniform_decode_query_len = span
                 self.decode_token_per_req = span
                 self._set_dynamic_spec_span(span)
+                # dispatch() only returns FULL for descriptors present in the
+                # dispatcher's FULL key set, which init built from the config
+                # span -- so this span's (bucket, bucket/span) descriptors are
+                # missing and dispatch falls back to PIECEWISE, which
+                # _dummy_run rejects as a mode mismatch. Keys accumulate in a
+                # set, so re-initializing adds this span's keys and keeps the
+                # config span's. Runtime dispatch needs them too (a K switch
+                # must find FULL, not lazily capture mid-serving).
+                dispatcher = getattr(self, "cudagraph_dispatcher", None)
+                saved_disp_span = getattr(dispatcher, "uniform_decode_query_len", None)
+                if dispatcher is not None:
+                    dispatcher.uniform_decode_query_len = span
+                    dispatcher.initialize_cudagraph_keys(
+                        self.compilation_config.cudagraph_mode, span
+                    )
                 failed = 0
                 try:
                     for size in self.compilation_config.cudagraph_capture_sizes:
@@ -5131,6 +5146,11 @@ class NPUModelRunner(GPUModelRunner):
                         self.uniform_decode_query_len,
                         self.decode_token_per_req,
                     ) = saved
+                    # Keys stay registered (that is the point); only the span
+                    # attribute goes back -- runtime dispatch reads the
+                    # per-step _dynamic_spec_span instead.
+                    if dispatcher is not None and saved_disp_span is not None:
+                        dispatcher.uniform_decode_query_len = saved_disp_span
                     self._set_dynamic_spec_span(None)
                     set_cudagraph_capturing_enabled(False)
                 _logger.info("Dynamic-K pre-capture: K=%d done (%d sizes failed)", k, failed)
